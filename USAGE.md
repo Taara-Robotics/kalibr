@@ -46,11 +46,11 @@ Record a **slow, steady** dataset for camera intrinsics:
 # set recording directory for intrinsics calibration
 INTRINSICS_DIR=/workspaces/kalibr/data/be2_15fps_aprilgrid_intrinsics
 
-# convert TUM dataset to ROS bag (--imu-signs for Orbbec: flip gyro signs)
+# convert TUM dataset to ROS bag (--imu-signs for Orbbec: convert to REP-103)
 python3 /workspaces/kalibr/aslam_offline_calibration/kalibr/python/kalibr_bagcreater_tum \
     --folder $INTRINSICS_DIR \
     --output-bag $INTRINSICS_DIR/recording.bag \
-    --imu-signs "1,1,1,-1,-1,-1"
+    --imu-signs="-1,1,-1,1,-1,1"
 
 # run camera calibration
 rosrun kalibr kalibr_calibrate_cameras \
@@ -80,8 +80,7 @@ IMUCAM_DIR=/workspaces/kalibr/data/be2_15fps_aprilgrid5
 # convert TUM dataset to ROS bag
 python3 /workspaces/kalibr/aslam_offline_calibration/kalibr/python/kalibr_bagcreater_tum \
     --folder $IMUCAM_DIR \
-    --output-bag $IMUCAM_DIR/recording.bag \
-    --imu-signs "1,1,1,-1,-1,-1"
+    --output-bag $IMUCAM_DIR/recording.bag
 
 # run IMU-camera calibration using intrinsics from Step 1
 rosrun kalibr kalibr_calibrate_imu_camera \
