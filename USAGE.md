@@ -52,7 +52,7 @@ python3 /workspaces/kalibr/aslam_offline_calibration/kalibr/python/kalibr_bagcre
     --output-bag $INTRINSICS_DIR/recording.bag \
     --imu-signs "1,1,1,-1,-1,-1"
 
-# run camera calibration, creates recording-camchain.yaml
+# run camera calibration
 rosrun kalibr kalibr_calibrate_cameras \
     --bag $INTRINSICS_DIR/recording.bag \
     --topics /cam0/image_raw \
@@ -60,6 +60,8 @@ rosrun kalibr kalibr_calibrate_cameras \
     --models pinhole-radtan \
     --dont-show-report
 ```
+
+**Output:** `$INTRINSICS_DIR/recording-camchain.yaml` (camera intrinsics, used in Step 2)
 
 Expected reprojection error: < 0.5 px
 
@@ -95,4 +97,18 @@ Expected errors:
 - Gyroscope: < 0.15 rad/s
 - Accelerometer: < 1.0 m/s²
 
-Final results are in `recording-camchain-imucam.yaml`
+**Output:** `$IMUCAM_DIR/recording-camchain-imucam.yaml` (IMU-camera extrinsics and timeshift)
+
+## Step 3: Export to RMAP Format
+
+Convert Kalibr output to RMAP format for VIO:
+
+```sh
+python3 /workspaces/kalibr/aslam_offline_calibration/kalibr/python/kalibr_export_vio \
+    --camchain $IMUCAM_DIR/recording-camchain-imucam.yaml \
+    --imu $IMUCAM_DIR/imu.yaml \
+    --results $IMUCAM_DIR/recording-results-imucam.txt \
+    --output $IMUCAM_DIR/rmap_calibration.yaml
+```
+
+**Output:** `$IMUCAM_DIR/rmap_calibration.yaml` with camera intrinsics, IMU noise, `camera_T_imu` transform, timeshift, and gravity magnitude

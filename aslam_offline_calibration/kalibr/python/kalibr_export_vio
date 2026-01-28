@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+Convert Kalibr calibration output to RMAP format for VIO.
+
+Usage:
+    kalibr_export_vio --camchain <camchain-imucam.yaml> --imu <imu.yaml> --results <results-imucam.txt> --output <vio_calibration.yaml>
+"""
+
+import argparse
+import yaml
+import numpy as np
+import re
+
+
+def load_yaml(path):
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def parse_gravity_from_results(results_path):
+    """Extract gravity vector from Kalibr results text file."""
+    with open(results_path, 'r') as f:
+        content = f.read()
+    
+    # Look for "Gravity vector in target coords: [m/s^2]" followed by vector
+    match = re.search(r'Gravity vector in target coords:.*?\n\s*\[([\d\s.\-e]+)\]', content)
+    if match:
+        values = [float(x) for x in match.group(1).split()]
+        return np.linalg.norm(values)
+    return None
+
+
+def matrix_to_row_major(T):
+    """Convert 4x4 matrix to row-major list."""
+    return [round(x, 8) for row in T for x in row]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Convert Kalibr calibration to RMAP format for VIO')
+    parser.add_argument('--camchain', required=True,
+                        help='Path to Kalibr camchain-imucam.yaml (from IMU-camera calibration)')
+    parser.add_argument('--imu', required=True,
+                        help='Path to imu.yaml with noise parameters')
+    parser.add_argument('--results', required=False,
+                        help='Path to Kalibr results-imucam.txt (to extract gravity magnitude)')
+    parser.add_argument('--output', required=True,
+                        help='Output path for RMAP calibration YAML')
+    parser.add_argument('--gravity', type=float, default=None,
+                        help='Override gravity magnitude (m/s^2). If not set, extracted from --results')
+    args = parser.parse_args()
+
+    # Load Kalibr outputs
+    camchain = load_yaml(args.camchain)
+    imu_params = load_yaml(args.imu)
+
+    # Determine gravity magnitude
+    gravity = args.gravity
+    if gravity is None and args.results:
+        gravity = parse_gravity_from_results(args.results)
+        if gravity:
+            print(f"Extracted gravity magnitude from results: {gravity:.5f} m/s^2")
+    if gravity is None:
+        print("Warning: No gravity magnitude available. Use --results or --gravity to provide it.")
+
+    cam0 = camchain['cam0']
+
+    # Extract camera parameters
+    resolution = cam0['resolution']
+    intrinsics = cam0['intrinsics']  # [fx, fy, cx, cy]
+    distortion = cam0['distortion_coeffs']  # [k1, k2, p1, p2] for radtan
+
+    # Extract IMU-camera transform and timeshift
+    T_cam_imu = np.array(cam0['T_cam_imu'])
+    timeshift = cam0.get('timeshift_cam_imu', 0.0)
+
+    # IMU noise parameters (Kalibr uses density, convert to sigma if needed)
+    # Kalibr: noise_density in units/sqrt(Hz), random_walk in units/s/sqrt(Hz)
+    accel_noise = imu_params.get('accelerometer_noise_density', 0.05)
+    gyro_noise = imu_params.get('gyroscope_noise_density', 0.005)
+    accel_rw = imu_params.get('accelerometer_random_walk', 0.001)
+    gyro_rw = imu_params.get('gyroscope_random_walk', 0.0001)
+
+    # Build output YAML
+    output = {
+        'Camera': {
+            'cols': resolution[0],
+            'rows': resolution[1],
+            'fx': intrinsics[0],
+            'fy': intrinsics[1],
+            'cx': intrinsics[2],
+            'cy': intrinsics[3],
+            'k1': distortion[0],
+            'k2': distortion[1],
+            'p1': distortion[2],
+            'p2': distortion[3],
+            'k3': 0.0,  # Kalibr radtan doesn't have k3
+        },
+        'VisualInertialOdometry': {
+            'gravity_magnitude': gravity,
+            'accel_noise_sigma': accel_noise,
+            'gyro_noise_sigma': gyro_noise,
+            'accel_bias_rw_sigma': accel_rw,
+            'gyro_bias_rw_sigma': gyro_rw,
+            'camera_T_imu': matrix_to_row_major(T_cam_imu),
+            'imu_timeshift': round(timeshift, 6),
+        }
+    }
+
+    # Write with custom formatting for readability
+    with open(args.output, 'w') as f:
+        f.write("Camera:\n")
+        f.write(f"  cols: {output['Camera']['cols']}\n")
+        f.write(f"  rows: {output['Camera']['rows']}\n")
+        f.write(f"  fx: {output['Camera']['fx']}\n")
+        f.write(f"  fy: {output['Camera']['fy']}\n")
+        f.write(f"  cx: {output['Camera']['cx']}\n")
+        f.write(f"  cy: {output['Camera']['cy']}\n")
+        f.write(f"  k1: {output['Camera']['k1']}\n")
+        f.write(f"  k2: {output['Camera']['k2']}\n")
+        f.write(f"  p1: {output['Camera']['p1']}\n")
+        f.write(f"  p2: {output['Camera']['p2']}\n")
+        f.write(f"  k3: {output['Camera']['k3']}\n")
+        f.write("\n")
+        f.write("VisualInertialOdometry:\n")
+        if gravity is not None:
+            f.write(f"  # Local gravity magnitude (m/s^2), extracted from Kalibr results\n")
+            f.write(f"  gravity_magnitude: {gravity}\n")
+        f.write(f"  # IMU noise parameters\n")
+        f.write(f"  accel_noise_sigma: {output['VisualInertialOdometry']['accel_noise_sigma']}  # m/s^2/sqrt(Hz)\n")
+        f.write(f"  gyro_noise_sigma: {output['VisualInertialOdometry']['gyro_noise_sigma']}  # rad/s/sqrt(Hz)\n")
+        f.write(f"  accel_bias_rw_sigma: {output['VisualInertialOdometry']['accel_bias_rw_sigma']}  # m/s^2 (bias random walk)\n")
+        f.write(f"  gyro_bias_rw_sigma: {output['VisualInertialOdometry']['gyro_bias_rw_sigma']}  # rad/s (bias random walk)\n")
+        f.write(f"  # camera_T_imu: Transform from IMU frame to camera frame\n")
+        
+        # Format the 4x4 matrix nicely
+        T = output['VisualInertialOdometry']['camera_T_imu']
+        f.write(f"  camera_T_imu: [{T[0]:>10.6f}, {T[1]:>10.6f}, {T[2]:>10.6f}, {T[3]:>10.6f},\n")
+        f.write(f"                 {T[4]:>10.6f}, {T[5]:>10.6f}, {T[6]:>10.6f}, {T[7]:>10.6f},\n")
+        f.write(f"                 {T[8]:>10.6f}, {T[9]:>10.6f}, {T[10]:>10.6f}, {T[11]:>10.6f},\n")
+        f.write(f"                 {T[12]:>10.6f}, {T[13]:>10.6f}, {T[14]:>10.6f}, {T[15]:>10.6f}]\n")
+        
+        f.write(f"  # IMU-camera time offset (seconds): positive means IMU timestamps lead camera\n")
+        f.write(f"  imu_timeshift: {output['VisualInertialOdometry']['imu_timeshift']}\n")
+
+    print(f"RMAP calibration saved to: {args.output}")
+
+
+if __name__ == '__main__':
+    main()
