@@ -69,6 +69,7 @@ install(TARGETS ${${PROJECT_NAME}_TARGETS}
 catkin_install_python(
   PROGRAMS
     python/kalibr_bagcreater
+    python/kalibr_bagcreater_tum
     python/kalibr_camera_focus
     python/kalibr_bagextractor
     python/kalibr_camera_validator

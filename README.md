@@ -16,6 +16,20 @@ To install follow the [install wiki page](https://github.com/ethz-asl/kalibr/wik
 Please find more information on the [wiki pages](https://github.com/ethz-asl/kalibr/wiki) of this repository.
 For questions or comments, please open an issue on Github.
 
+## Development with VS Code Dev Containers
+
+This repository includes a devcontainer configuration for development in VS Code.
+
+1. Install [VS Code](https://code.visualstudio.com/) and the [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)
+2. Open this repository in VS Code
+3. When prompted, click "Reopen in Container" (or run the command `Dev Containers: Reopen in Container`)
+4. Once the container is running, build the workspace:
+   ```bash
+   catkin build -j$(nproc)
+   ```
+
+The devcontainer automatically configures your shell to source ROS and the kalibr workspace. Place your calibration data in the `data/` folder.
+
 
 ## News / Events
 

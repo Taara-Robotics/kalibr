@@ -1,0 +1,5 @@
+# Data directory for kalibr
+
+# Place your calibration data (rosbags, images, etc.) here.
+
+# This folder is mounted to /data inside the container.

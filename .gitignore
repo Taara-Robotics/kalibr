@@ -53,3 +53,10 @@ Build
 
 # vs-code
 .vscode
+
+# Data
+/data/*
+!/data/.gitkeep
+/.catkin_tools
+/devel
+/logs

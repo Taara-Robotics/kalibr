@@ -1,0 +1,467 @@
+#!/usr/bin/env python
+"""
+Convert TUM-format dataset to ROS bag for use with Kalibr.
+
+TUM Format Expected:
+    dataset_dir/
+        rgb.txt         # timestamp filename
+        imu.txt         # timestamp ax ay az gx gy gz
+        rgb/            # image directory
+    
+    For multi-camera setups:
+    dataset_dir/
+        cam0/
+            rgb.txt
+            rgb/
+        cam1/
+            rgb.txt  
+            rgb/
+        imu.txt
+
+rgb.txt format:
+    # comments start with #
+    timestamp filename
+    1305031102.175304 rgb/1305031102.175304.png
+
+imu.txt format:
+    # comments start with #
+    timestamp ax ay az gx gy gz
+    1305031098.690000 -0.1432 9.8214 0.0312 0.0021 -0.0043 0.0012
+
+Timestamps are in seconds (floating point).
+Accelerometer values in m/s^2, gyroscope in rad/s.
+
+Example usage:
+    kalibr_bagcreater_tum --folder /path/to/tum_data --output-bag output.bag
+    kalibr_bagcreater_tum --folder /path/to/tum_data --output-bag output.bag --cam-topic /cam0/image_raw --imu-topic /imu0
+"""
+
+print("importing libraries")
+
+import rosbag
+import rospy
+from sensor_msgs.msg import Image
+from sensor_msgs.msg import Imu
+import sys
+import os
+import argparse
+import cv2
+import numpy as np
+import yaml
+
+# Optional LZ4 support for raw compressed images
+try:
+    import lz4.frame
+    import lz4.block
+    HAS_LZ4 = True
+except ImportError:
+    HAS_LZ4 = False
+
+def parseArgs():
+    parser = argparse.ArgumentParser(
+        description='Create a ROS bag from TUM-format dataset (rgb.txt + imu.txt).')
+    
+    parser.add_argument('--folder', metavar='folder', required=True,
+                        help='TUM dataset folder containing rgb.txt and imu.txt')
+    parser.add_argument('--output-bag', metavar='output_bag', default="output.bag",
+                        help='Output ROS bag file (default: %(default)s)')
+    
+    # Camera options
+    parser.add_argument('--rgb-file', metavar='rgb_file', default='rgb.txt',
+                        help='RGB timestamps file (default: %(default)s)')
+    parser.add_argument('--cam-topic', metavar='cam_topic', default='/cam0/image_raw',
+                        help='ROS topic for camera images (default: %(default)s)')
+    
+    # IMU options  
+    parser.add_argument('--imu-file', metavar='imu_file', default='imu.txt',
+                        help='IMU data file (default: %(default)s)')
+    parser.add_argument('--imu-topic', metavar='imu_topic', default='/imu0',
+                        help='ROS topic for IMU data (default: %(default)s)')
+    
+    # Multi-camera support
+    parser.add_argument('--cam-folders', metavar='cam_folders', nargs='*',
+                        help='Camera subdirectory names for multi-cam setup (e.g., cam0 cam1). '
+                             'Each should contain rgb.txt and images.')
+    
+    # Optional time offset
+    parser.add_argument('--time-offset', metavar='offset', type=float, default=0.0,
+                        help='Time offset to add to all timestamps [s] (default: %(default)s)')
+    
+    # IMU axis transformation for non-standard conventions
+    parser.add_argument('--imu-flip-xz', action='store_true',
+                        help='Flip IMU X and Z axes (for Orbbec sensors: X-back,Y-left,Z-down -> X-fwd,Y-left,Z-up)')
+    parser.add_argument('--imu-signs', metavar='signs', default=None,
+                        help='Custom IMU axis signs as 6 values: ax,ay,az,gx,gy,gz (e.g., "-1,1,-1,-1,-1,-1" for flip all except ay)')
+    
+    # Raw LZ4 compressed image support
+    parser.add_argument('--config', metavar='config_file', default=None,
+                        help='Config YAML file with image dimensions for raw.lz4 files (auto-detected from folder/config.yaml)')
+    
+    if len(sys.argv) < 2:
+        parser.print_help()
+        sys.exit(0)
+    
+    return parser.parse_args()
+
+
+def parseRgbTxt(filepath):
+    """
+    Parse TUM rgb.txt file.
+    
+    Returns:
+        List of (timestamp_sec, image_path) tuples
+    """
+    entries = []
+    base_dir = os.path.dirname(filepath)
+    
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            parts = line.split()
+            if len(parts) >= 2:
+                timestamp = float(parts[0])
+                image_path = parts[1]
+                
+                # Make path absolute if relative
+                if not os.path.isabs(image_path):
+                    image_path = os.path.join(base_dir, image_path)
+                
+                entries.append((timestamp, image_path))
+    
+    return sorted(entries, key=lambda x: x[0])
+
+
+def parseImuTxt(filepath):
+    """
+    Parse TUM imu.txt file.
+    
+    Expected format: timestamp ax ay az gx gy gz
+    
+    Returns:
+        List of (timestamp_sec, [ax,ay,az], [gx,gy,gz]) tuples
+    """
+    entries = []
+    
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            
+            parts = line.split()
+            if len(parts) >= 7:
+                timestamp = float(parts[0])
+                accel = [float(parts[1]), float(parts[2]), float(parts[3])]
+                gyro = [float(parts[4]), float(parts[5]), float(parts[6])]
+                entries.append((timestamp, accel, gyro))
+    
+    return sorted(entries, key=lambda x: x[0])
+
+
+def timestampToRosTime(timestamp_sec):
+    """Convert floating point timestamp (seconds) to rospy.Time."""
+    secs = int(timestamp_sec)
+    nsecs = int((timestamp_sec - secs) * 1e9)
+    return rospy.Time(secs, nsecs)
+
+
+def loadRawLz4Image(image_path, width, height, color_order='RGB'):
+    """
+    Load a raw LZ4-compressed image file.
+    
+    Args:
+        image_path: Path to the .raw.lz4 file
+        width: Image width in pixels
+        height: Image height in pixels
+        color_order: Color channel order ('RGB' or 'BGR')
+    
+    Returns:
+        numpy array of shape (height, width, 3) in BGR format (OpenCV convention)
+    """
+    if not HAS_LZ4:
+        raise RuntimeError("lz4 package not installed. Install with: pip install lz4")
+    
+    with open(image_path, 'rb') as f:
+        compressed_data = f.read()
+    
+    # Calculate expected sizes
+    expected_rgb = width * height * 3
+    expected_gray = width * height
+    
+    # Try LZ4 block format first (with known uncompressed size), then frame format
+    try:
+        # LZ4 block format requires knowing the uncompressed size
+        raw_data = lz4.block.decompress(compressed_data, uncompressed_size=expected_rgb)
+    except Exception:
+        try:
+            # Try grayscale size
+            raw_data = lz4.block.decompress(compressed_data, uncompressed_size=expected_gray)
+        except Exception:
+            try:
+                # Try 16-bit depth size
+                raw_data = lz4.block.decompress(compressed_data, uncompressed_size=expected_gray * 2)
+            except Exception:
+                # Fall back to LZ4 frame format (auto-detects size)
+                raw_data = lz4.frame.decompress(compressed_data)
+    
+    if len(raw_data) == expected_rgb:
+        # RGB/BGR image
+        image_np = np.frombuffer(raw_data, dtype=np.uint8).reshape((height, width, 3))
+        if color_order == 'RGB':
+            image_np = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+    elif len(raw_data) == expected_gray:
+        # Grayscale image
+        image_np = np.frombuffer(raw_data, dtype=np.uint8).reshape((height, width))
+    elif len(raw_data) == expected_gray * 2:
+        # 16-bit depth image
+        image_np = np.frombuffer(raw_data, dtype=np.uint16).reshape((height, width))
+    else:
+        raise RuntimeError("Unexpected raw data size: {} bytes (expected {} for RGB or {} for grayscale, {}x{})".format(
+            len(raw_data), expected_rgb, expected_gray, width, height))
+    
+    return image_np
+
+
+def loadImageToRosMsg(image_path, timestamp_sec, frame_id, raw_config=None):
+    """Load image file and create ROS Image message.
+    
+    Args:
+        image_path: Path to image file (supports .png, .jpg, .raw.lz4)
+        timestamp_sec: Timestamp in seconds
+        frame_id: ROS frame ID
+        raw_config: Dict with 'width', 'height', 'color_order' for raw.lz4 files
+    """
+    # Check if this is a raw.lz4 file
+    if image_path.endswith('.raw.lz4'):
+        if raw_config is None:
+            raise RuntimeError("raw_config required for .raw.lz4 files. "
+                             "Provide --config or ensure config.yaml exists in folder.")
+        image_np = loadRawLz4Image(
+            image_path, 
+            raw_config['width'], 
+            raw_config['height'],
+            raw_config.get('color_order', 'RGB')
+        )
+    else:
+        image_np = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    
+    if image_np is None:
+        raise RuntimeError("Failed to load image: {}".format(image_path))
+    
+    timestamp = timestampToRosTime(timestamp_sec)
+    
+    rosimage = Image()
+    rosimage.header.stamp = timestamp
+    rosimage.header.frame_id = frame_id
+    rosimage.height = image_np.shape[0]
+    rosimage.width = image_np.shape[1]
+    
+    # Handle different image formats
+    if len(image_np.shape) == 2:
+        # Grayscale
+        rosimage.encoding = "mono8"
+        rosimage.step = rosimage.width
+        rosimage.data = image_np.tobytes()
+    elif image_np.shape[2] == 3:
+        # BGR -> convert to grayscale for kalibr
+        image_gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+        rosimage.encoding = "mono8"
+        rosimage.step = rosimage.width
+        rosimage.data = image_gray.tobytes()
+    elif image_np.shape[2] == 4:
+        # BGRA -> convert to grayscale
+        image_gray = cv2.cvtColor(image_np, cv2.COLOR_BGRA2GRAY)
+        rosimage.encoding = "mono8"
+        rosimage.step = rosimage.width
+        rosimage.data = image_gray.tobytes()
+    else:
+        raise RuntimeError("Unsupported image format: {}".format(image_np.shape))
+    
+    return rosimage, timestamp
+
+
+def createImuMessage(timestamp_sec, accel, gyro, frame_id, flip_xz=False, signs=None):
+    """Create ROS IMU message.
+    
+    Args:
+        flip_xz: If True, flip X and Z axes for Orbbec IMU convention
+                 (X-back,Y-left,Z-down -> X-forward,Y-left,Z-up)
+        signs: Optional list of 6 sign multipliers [ax,ay,az,gx,gy,gz]
+    """
+    timestamp = timestampToRosTime(timestamp_sec)
+    
+    if signs is not None:
+        accel = [accel[0]*signs[0], accel[1]*signs[1], accel[2]*signs[2]]
+        gyro = [gyro[0]*signs[3], gyro[1]*signs[4], gyro[2]*signs[5]]
+    elif flip_xz:
+        # Transform from Orbbec (X-back, Y-left, Z-down) to ROS (X-fwd, Y-left, Z-up)
+        accel = [-accel[0], accel[1], -accel[2]]
+        gyro = [-gyro[0], gyro[1], -gyro[2]]
+    
+    rosimu = Imu()
+    rosimu.header.stamp = timestamp
+    rosimu.header.frame_id = frame_id
+    rosimu.angular_velocity.x = gyro[0]
+    rosimu.angular_velocity.y = gyro[1]
+    rosimu.angular_velocity.z = gyro[2]
+    rosimu.linear_acceleration.x = accel[0]
+    rosimu.linear_acceleration.y = accel[1]
+    rosimu.linear_acceleration.z = accel[2]
+    
+    return rosimu, timestamp
+
+
+def main():
+    parsed = parseArgs()
+    
+    print("")
+    print("=" * 60)
+    print("TUM to ROS Bag Converter")
+    print("=" * 60)
+    print("")
+    print("Input folder: {}".format(parsed.folder))
+    print("Output bag:   {}".format(parsed.output_bag))
+    print("")
+    
+    # Load config for raw.lz4 support
+    raw_config = None
+    config_path = parsed.config
+    if config_path is None:
+        config_path = os.path.join(parsed.folder, 'config.yaml')
+    
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        if 'Camera' in config:
+            cam_config = config['Camera']
+            raw_config = {
+                'width': cam_config.get('cols', 1280),
+                'height': cam_config.get('rows', 720),
+                'color_order': cam_config.get('color_order', 'RGB')
+            }
+            print("Loaded config: {}x{}, color_order={}".format(
+                raw_config['width'], raw_config['height'], raw_config['color_order']))
+            print("")
+    
+    # Collect all cameras to process
+    cameras = []
+    
+    if parsed.cam_folders:
+        # Multi-camera setup
+        for i, cam_folder in enumerate(parsed.cam_folders):
+            rgb_path = os.path.join(parsed.folder, cam_folder, 'rgb.txt')
+            if os.path.exists(rgb_path):
+                topic = "/cam{}/image_raw".format(i)
+                cameras.append((rgb_path, topic, cam_folder))
+                print("Found camera {}: {} -> {}".format(i, rgb_path, topic))
+            else:
+                print("Warning: rgb.txt not found in {}".format(cam_folder))
+    else:
+        # Single camera setup
+        rgb_path = os.path.join(parsed.folder, parsed.rgb_file)
+        if os.path.exists(rgb_path):
+            cameras.append((rgb_path, parsed.cam_topic, "cam0"))
+            print("Found camera: {} -> {}".format(rgb_path, parsed.cam_topic))
+        else:
+            print("Warning: {} not found".format(rgb_path))
+    
+    # Find IMU file
+    imu_path = os.path.join(parsed.folder, parsed.imu_file)
+    has_imu = os.path.exists(imu_path)
+    if has_imu:
+        print("Found IMU: {} -> {}".format(imu_path, parsed.imu_topic))
+    else:
+        print("Warning: {} not found".format(imu_path))
+    
+    if not cameras and not has_imu:
+        print("Error: No data found!")
+        sys.exit(1)
+    
+    print("")
+    
+    # Create the bag
+    try:
+        bag = rosbag.Bag(parsed.output_bag, 'w')
+        
+        # Write camera images
+        for rgb_path, topic, frame_id in cameras:
+            print("Processing {}...".format(rgb_path))
+            entries = parseRgbTxt(rgb_path)
+            print("  Found {} images".format(len(entries)))
+            
+            # Check if raw.lz4 files and config is available
+            if len(entries) > 0 and entries[0][1].endswith('.raw.lz4'):
+                if raw_config is None:
+                    print("  Error: .raw.lz4 files require config.yaml with Camera dimensions")
+                    print("  Create config.yaml or use --config option")
+                    sys.exit(1)
+                print("  Using raw.lz4 format: {}x{} {}".format(
+                    raw_config['width'], raw_config['height'], raw_config['color_order']))
+            
+            for i, (timestamp, image_path) in enumerate(entries):
+                timestamp += parsed.time_offset
+                try:
+                    image_msg, ros_time = loadImageToRosMsg(image_path, timestamp, frame_id, raw_config)
+                    bag.write(topic, image_msg, ros_time)
+                except Exception as e:
+                    print("  Warning: Failed to process {}: {}".format(image_path, e))
+                
+                if (i + 1) % 100 == 0:
+                    print("  Processed {}/{} images".format(i + 1, len(entries)))
+            
+            print("  Done! Wrote {} images to {}".format(len(entries), topic))
+        
+        # Write IMU data
+        if has_imu:
+            print("Processing {}...".format(imu_path))
+            entries = parseImuTxt(imu_path)
+            print("  Found {} IMU measurements".format(len(entries)))
+            
+            # Parse custom signs if provided
+            imu_signs = None
+            if parsed.imu_signs:
+                imu_signs = [float(x) for x in parsed.imu_signs.split(',')]
+                if len(imu_signs) != 6:
+                    raise ValueError("--imu-signs must have exactly 6 values: ax,ay,az,gx,gy,gz")
+                print("  Applying custom signs: ax={}, ay={}, az={}, gx={}, gy={}, gz={}".format(*imu_signs))
+            elif parsed.imu_flip_xz:
+                print("  Applying axis flip (Orbbec convention -> ROS convention)")
+            
+            frame_id = parsed.imu_topic.strip('/').replace('/', '_')
+            for timestamp, accel, gyro in entries:
+                timestamp += parsed.time_offset
+                imu_msg, ros_time = createImuMessage(timestamp, accel, gyro, frame_id, flip_xz=parsed.imu_flip_xz, signs=imu_signs)
+                bag.write(parsed.imu_topic, imu_msg, ros_time)
+            
+            print("  Done! Wrote {} IMU messages to {}".format(len(entries), parsed.imu_topic))
+        
+        print("")
+        print("Successfully created: {}".format(parsed.output_bag))
+        
+    finally:
+        bag.close()
+    
+    # Print summary info for kalibr usage
+    print("")
+    print("=" * 60)
+    print("Next steps for Kalibr calibration:")
+    print("=" * 60)
+    print("")
+    print("1. Create camera calibration YAML (camchain.yaml) with:")
+    for _, topic, _ in cameras:
+        print("   rostopic: {}".format(topic))
+    print("")
+    print("2. Create IMU calibration YAML (imu.yaml) with:")
+    print("   rostopic: {}".format(parsed.imu_topic))
+    print("")
+    print("3. Run calibration:")
+    print("   kalibr_calibrate_imu_camera --bag {} \\".format(parsed.output_bag))
+    print("       --cam camchain.yaml --imu imu.yaml --target target.yaml")
+    print("")
+
+
+if __name__ == "__main__":
+    main()
