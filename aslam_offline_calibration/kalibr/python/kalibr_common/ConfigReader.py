@@ -618,11 +618,17 @@ class CalibrationTargetParameters(ParametersBase):
                 errList.append("invalid tagSize (float)")
             if not isinstance(tagSpacing,float) or tagSpacing <= 0.0:
                 errList.append("invalid tagSpacing (float)")
+            
+            # Optional: target height from floor (for robot extrinsics calibration)
+            targetHeight = self.data.get("targetHeight", 0.0)
+            if not isinstance(targetHeight, (int, float)):
+                errList.append("invalid targetHeight (float)")
                 
             targetParams = {'tagRows': tagRows,
                             'tagCols': tagCols,
                             'tagSize': tagSize,
                             'tagSpacing': tagSpacing,
+                            'targetHeight': float(targetHeight),
                             'targetType': targetType}
             
         return targetParams

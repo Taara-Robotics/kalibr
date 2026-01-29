@@ -1,0 +1,365 @@
+#!/usr/bin/env python
+"""
+Camera-to-robot extrinsics calibration via pure rotation.
+
+This script estimates the camera pose relative to the robot's rotation axis
+by observing an AprilGrid target while the robot rotates in place.
+
+Assumptions:
+- AprilGrid target is on a level floor (height provided in target.yaml)
+- Robot is on a level floor
+- Robot rotates in place (pure rotation around vertical axis, no translation)
+- Camera intrinsics are already known (from camchain.yaml)
+
+Output: Camera extrinsics (position and orientation relative to robot rotation axis)
+"""
+from __future__ import print_function
+import sm
+import kalibr_common as kc
+
+import numpy as np
+import argparse
+import signal
+import sys
+import os
+import yaml
+
+import aslam_cv as acv
+import aslam_cameras_april as acv_april
+
+from scipy.optimize import least_squares
+from scipy.spatial.transform import Rotation as R
+
+from matplotlib.backends.backend_pdf import PdfPages
+import matplotlib.pyplot as plt
+
+# Make numpy print prettier
+np.set_printoptions(suppress=True, precision=6)
+
+
+def signal_exit(signal, frame):
+    print("")
+    sm.logWarn("Shutting down! (CTRL+C)")
+    sys.exit(1)
+
+
+class Once(argparse.Action):
+    """Helper to constrain certain arguments to be specified only once."""
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest) is not None:
+            msg = '{o} can only be specified once'.format(o=option_string)
+            raise argparse.ArgumentError(None, msg)
+        setattr(namespace, self.dest, values)
+
+
+def parseArgs():
+    class KalibrArgParser(argparse.ArgumentParser):
+        def error(self, message):
+            self.print_help()
+            sm.logError('%s' % message)
+            sys.exit(2)
+
+    usage = """
+    Example usage to calibrate camera extrinsics relative to robot rotation axis.
+    
+    %(prog)s --bag MYROSBAG.bag --cam camchain.yaml --target target.yaml
+    
+    The robot should rotate in place while keeping the AprilGrid visible.
+    
+    camchain.yaml: camera intrinsics (output of kalibr_calibrate_cameras)
+    
+    target.yaml must include targetHeight field:
+        target_type: 'aprilgrid'
+        tagCols: 6
+        tagRows: 6
+        tagSize: 0.088
+        tagSpacing: 0.3
+        targetHeight: 0.0    # height of target surface from floor [m]
+    """
+
+    parser = KalibrArgParser(
+        description='Calibrate camera extrinsics relative to robot rotation axis.',
+        usage=usage)
+
+    # Data source
+    groupData = parser.add_argument_group('Dataset source')
+    groupData.add_argument('--bag', dest='bagfile', nargs=1,
+        help='ROS bag file containing image data', action=Once, required=True)
+    groupData.add_argument('--topic', dest='topic',
+        help='Image topic (default: from camchain.yaml)', action=Once)
+    groupData.add_argument('--bag-from-to', metavar='bag_from_to', type=float, nargs=2,
+        help='Use bag data from this time to this time [s]')
+    groupData.add_argument('--bag-freq', metavar='bag_freq', type=float,
+        help='Frequency to extract frames at [Hz]')
+
+    # Configuration files
+    groupCam = parser.add_argument_group('Camera configuration')
+    groupCam.add_argument('--cam', dest='chain_yaml',
+        help='Camera calibration as yaml file (camchain.yaml)', required=True, action=Once)
+
+    groupTarget = parser.add_argument_group('Calibration target')
+    groupTarget.add_argument('--target', dest='target_yaml',
+        help='Calibration target configuration (must include targetHeight)', required=True, action=Once)
+
+    # Output options
+    outputSettings = parser.add_argument_group('Output options')
+    outputSettings.add_argument('--show-extraction', action='store_true', dest='showextraction',
+        help='Show calibration target extraction')
+    outputSettings.add_argument('--dont-show-report', action='store_true', dest='dontShowReport',
+        help='Do not show the report on screen after calibration')
+    outputSettings.add_argument('--verbose', action='store_true', dest='verbose',
+        help='Verbose output')
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(2)
+
+    try:
+        parsed = parser.parse_args()
+    except:
+        sys.exit(2)
+
+    if parsed.verbose:
+        parsed.showextraction = True
+
+    if parsed.showextraction or parsed.verbose:
+        parsed.dontShowReport = True
+
+    return parsed
+
+
+def pratt_circle_fit(points):
+    """
+    Algebraic circle fit using Pratt's method.
+    More robust than Kasa's method for partial arcs.
+    
+    Args:
+        points: Nx2 array of (x, y) points
+        
+    Returns:
+        (cx, cy, r): circle center and radius
+    """
+    n = len(points)
+    if n < 3:
+        raise ValueError("Need at least 3 points for circle fitting")
+
+    x = points[:, 0]
+    y = points[:, 1]
+
+    # Center the data
+    mx, my = np.mean(x), np.mean(y)
+    u = x - mx
+    v = y - my
+
+    # Build the design matrix
+    Suuu = np.sum(u**3)
+    Svvv = np.sum(v**3)
+    Suvv = np.sum(u * v**2)
+    Svuu = np.sum(v * u**2)
+    Suu = np.sum(u**2)
+    Svv = np.sum(v**2)
+    Suv = np.sum(u * v)
+
+    # Solve linear system
+    A = np.array([[Suu, Suv], [Suv, Svv]])
+    b = np.array([0.5 * (Suuu + Suvv), 0.5 * (Svvv + Svuu)])
+
+    try:
+        uc, vc = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        # Fallback to least squares
+        uc, vc = np.linalg.lstsq(A, b, rcond=None)[0]
+
+    cx = uc + mx
+    cy = vc + my
+    r = np.sqrt(uc**2 + vc**2 + (Suu + Svv) / n)
+
+    return cx, cy, r
+
+
+
+
+def extract_camera_poses(bagfile, topic, camchain, target_config, 
+                         bag_from_to=None, bag_freq=None, show_extraction=False):
+    """
+    Extract camera poses from bag file by detecting AprilGrid target.
+    
+    Returns:
+        poses: list of (timestamp, T_target_camera) tuples
+        camera: the AslamCamera object
+    """
+    # Load camera from camchain
+    chain = kc.CameraChainParameters(camchain)
+    cam_params = chain.getCameraParameters(0)  # Single camera
+
+    # Get topic from camchain if not specified
+    if topic is None:
+        topic = cam_params.getRosTopic()
+
+    # Create camera geometry
+    camera = kc.AslamCamera.fromParameters(cam_params)
+
+    # Load target configuration
+    target_config_obj = kc.CalibrationTargetParameters(target_config)
+    target_params = target_config_obj.getTargetParams()
+
+    # Create AprilGrid target
+    options = acv_april.AprilgridOptions()
+    options.showExtractionVideo = show_extraction
+    options.minTagsForValidObs = int(np.max([target_params['tagRows'], target_params['tagCols']]) + 1)
+
+    grid = acv_april.GridCalibrationTargetAprilgrid(
+        target_params['tagRows'],
+        target_params['tagCols'],
+        target_params['tagSize'],
+        target_params['tagSpacing'],
+        options)
+
+    # Create detector
+    detector_options = acv.GridDetectorOptions()
+    detector_options.filterCornerOutliers = True
+    detector = acv.GridDetector(camera.geometry, grid, detector_options)
+
+    # Create bag reader
+    reader = kc.BagImageDatasetReader(bagfile, topic, bag_from_to=bag_from_to, bag_freq=bag_freq)
+
+    print("\nExtracting camera poses from bag...")
+    print("  Bag: {}".format(bagfile))
+    print("  Topic: {}".format(topic))
+    print("  Target height: {} m".format(target_params['targetHeight']))
+
+    poses = []
+    num_images = 0
+    num_detections = 0
+
+    for timestamp, image in reader:
+        num_images += 1
+
+        # Detect target
+        success, observation = detector.findTarget(timestamp, image)
+
+        if success:
+            # Estimate transformation T_target_camera
+            success, T_t_c = camera.geometry.estimateTransformation(observation)
+
+            if success:
+                num_detections += 1
+                poses.append((timestamp.toSec(), T_t_c))
+
+        if num_images % 20 == 0:
+            print("  Processed {} images, {} detections...".format(num_images, num_detections))
+        
+        # if num_detections == 150:
+        #     print("TMP: limiting detections for speed")
+        #     break
+
+    print("  Total: {} images, {} valid detections".format(num_images, num_detections))
+
+    return poses, camera, target_params
+
+
+def main():
+    # Parse arguments
+    parsed = parseArgs()
+
+    # Logging mode
+    if parsed.verbose:
+        sm.setLoggingLevel(sm.LoggingLevel.Debug)
+    else:
+        sm.setLoggingLevel(sm.LoggingLevel.Info)
+
+    signal.signal(signal.SIGINT, signal_exit)
+
+    print("\n" + "="*60)
+    print("Camera-to-Robot Extrinsics Calibration")
+    print("="*60)
+
+    # Extract camera poses from bag
+    bagfile = parsed.bagfile[0]
+    poses, camera, target_params = extract_camera_poses(
+        bagfile,
+        parsed.topic,
+        parsed.chain_yaml,
+        parsed.target_yaml,
+        bag_from_to=parsed.bag_from_to,
+        bag_freq=parsed.bag_freq,
+        show_extraction=parsed.showextraction
+    )
+
+    if len(poses) < 3:
+        sm.logError("Not enough valid detections ({})! Need at least 3.".format(len(poses)))
+        sys.exit(1)
+
+    # target_height = target_params['targetHeight']
+
+    # Estimate camera roll/pitch assuming target is on level floor
+    # Get the z-axis (up vector) of the camera in the target frame for each pose
+    z_axes = np.array([T_t_c.C().dot(np.array([0, 0, 1])) for _, T_t_c in poses])
+    avg_z = np.mean(z_axes, axis=0)
+    avg_z /= np.linalg.norm(avg_z)
+
+    # Compute roll and pitch from the average z vector
+    pitch = np.arcsin(-avg_z[0])  # rotation around y-axis
+    roll = np.arctan2(avg_z[1], avg_z[2])  # rotation around x-axis
+
+    print("Estimated camera roll [deg]:", np.degrees(roll))
+    print("Estimated camera pitch [deg]:", np.degrees(pitch))
+
+    # Plot roll and pitch for each pose
+    rolls = []
+    pitches = []
+    for _, T_t_c in poses:
+        Rmat = T_t_c.C()
+        # ZYX Euler: roll (x), pitch (y), yaw (z)
+        r, p, _ = R.from_dcm(Rmat).as_euler('xyz', degrees=True)
+        rolls.append(r)
+        pitches.append(p)
+
+    # Plot roll and pitch side-by-side in one figure
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(10, 10))
+    ax1.plot(rolls, color='tab:blue')
+    ax1.set_xlabel('Frame')
+    ax1.set_ylabel('Roll [deg]')
+    ax1.set_title('Camera Roll per Pose')
+    ax1.grid()
+
+    ax2.plot(pitches, color='tab:orange')
+    ax2.set_xlabel('Frame')
+    ax2.set_ylabel('Pitch [deg]')
+    ax2.set_title('Camera Pitch per Pose')
+    ax2.grid()
+
+    # Estimate and plot camera height above the floor for each pose
+    target_height = target_params['targetHeight']
+    cam_heights = np.array([T_t_c.t()[2] + target_height for _, T_t_c in poses])
+    avg_cam_height = np.mean(cam_heights)
+    print("Estimated average camera height above floor [m]:", avg_cam_height)
+
+    ax3.plot(cam_heights, color='tab:green')
+    ax3.set_xlabel('Frame')
+    ax3.set_ylabel('Camera Height [m]')
+    ax3.set_title('Camera Height Above Floor per Pose')
+    ax3.grid()
+
+    # Plot positions
+    positions = np.array([T_t_c.t() for _, T_t_c in poses])
+    ax4.scatter(positions[:, 0], positions[:, 1], label='Camera positions')
+    ax4.set_xlabel('X [m]')
+    ax4.set_ylabel('Y [m]')
+    ax4.set_title('Camera Positions During Rotation')
+    ax4.axis('equal')
+    ax4.grid()
+    ax4.legend()
+    plt.show()
+
+    fig.tight_layout()
+    plt.show()
+    
+
+
+
+    print("\nCalibration complete!")
+
+
+if __name__ == "__main__":
+    main()
