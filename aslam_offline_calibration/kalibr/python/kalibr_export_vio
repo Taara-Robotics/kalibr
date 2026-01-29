@@ -48,6 +48,8 @@ def main():
                         help='Output path for RMAP calibration YAML')
     parser.add_argument('--gravity', type=float, default=None,
                         help='Override gravity magnitude (m/s^2). If not set, extracted from --results')
+    parser.add_argument('--extrinsics', required=False,
+                        help='Path to robot extrinsics YAML (recording-robot-extrinsics.yaml)')
     args = parser.parse_args()
 
     # Load Kalibr outputs
@@ -81,6 +83,17 @@ def main():
     accel_rw = imu_params.get('accelerometer_random_walk', 0.001)
     gyro_rw = imu_params.get('gyroscope_random_walk', 0.0001)
 
+
+
+    extrinsics_data = None
+    if args.extrinsics:
+        import os
+        if os.path.isfile(args.extrinsics):
+            with open(args.extrinsics, 'r') as ef:
+                extrinsics_yaml = yaml.safe_load(ef)
+                if 'extrinsics' in extrinsics_yaml:
+                    extrinsics_data = extrinsics_yaml['extrinsics']
+
     # Build output YAML
     output = {
         'Camera': {
@@ -107,6 +120,7 @@ def main():
         }
     }
 
+
     # Write with custom formatting for readability
     with open(args.output, 'w') as f:
         f.write("Camera:\n")
@@ -121,6 +135,11 @@ def main():
         f.write(f"  p1: {output['Camera']['p1']}\n")
         f.write(f"  p2: {output['Camera']['p2']}\n")
         f.write(f"  k3: {output['Camera']['k3']}\n")
+        # Write extrinsics if available
+        if extrinsics_data is not None:
+            f.write(f"  extrinsics:\n")
+            for key, value in extrinsics_data.items():
+                f.write(f"    {key}: {value}\n")
         f.write("\n")
         f.write("VisualInertialOdometry:\n")
         if gravity is not None:
@@ -132,14 +151,12 @@ def main():
         f.write(f"  accel_bias_rw_sigma: {output['VisualInertialOdometry']['accel_bias_rw_sigma']}  # m/s^2 (bias random walk)\n")
         f.write(f"  gyro_bias_rw_sigma: {output['VisualInertialOdometry']['gyro_bias_rw_sigma']}  # rad/s (bias random walk)\n")
         f.write(f"  # camera_T_imu: Transform from IMU frame to camera frame\n")
-        
         # Format the 4x4 matrix nicely
         T = output['VisualInertialOdometry']['camera_T_imu']
         f.write(f"  camera_T_imu: [{T[0]:>10.6f}, {T[1]:>10.6f}, {T[2]:>10.6f}, {T[3]:>10.6f},\n")
         f.write(f"                 {T[4]:>10.6f}, {T[5]:>10.6f}, {T[6]:>10.6f}, {T[7]:>10.6f},\n")
         f.write(f"                 {T[8]:>10.6f}, {T[9]:>10.6f}, {T[10]:>10.6f}, {T[11]:>10.6f},\n")
         f.write(f"                 {T[12]:>10.6f}, {T[13]:>10.6f}, {T[14]:>10.6f}, {T[15]:>10.6f}]\n")
-        
         f.write(f"  # IMU-camera time offset (seconds): positive means IMU timestamps lead camera\n")
         f.write(f"  imu_timeshift: {output['VisualInertialOdometry']['imu_timeshift']}\n")
 

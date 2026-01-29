@@ -102,21 +102,8 @@ Expected errors:
 
 **Output:** `$IMUCAM_DIR/recording-camchain-imucam.yaml` (IMU-camera extrinsics and timeshift)
 
-## Step 3: Export to RMAP Format
 
-Convert Kalibr output to RMAP format for VIO:
-
-```sh
-python3 /workspaces/kalibr/aslam_offline_calibration/kalibr/python/kalibr_export_vio \
-    --camchain $IMUCAM_DIR/recording-camchain-imucam.yaml \
-    --imu $DATA_DIR/imu.yaml \
-    --results $IMUCAM_DIR/recording-results-imucam.txt \
-    --output $IMUCAM_DIR/rmap_calibration.yaml
-```
-
-**Output:** `$IMUCAM_DIR/rmap_calibration.yaml` with camera intrinsics, IMU noise, `camera_T_imu` transform, timeshift, and gravity magnitude
-
-## Robot Extrinsics Calibration (Optional)
+## Step 3: Robot Extrinsics Calibration
 
 Calibrate camera position relative to robot's rotation axis. Useful for robots that rotate in place.
 
@@ -136,9 +123,9 @@ targetHeight: 0.0  # height of target surface from floor [m]
 ### Recording
 
 Record a dataset with the robot rotating in place while viewing the AprilGrid:
-- Place AprilGrid flat on the floor (or at known height)
+- Place AprilGrid flat on the floor
 - Robot should be on a level floor
-- Rotate robot in place through at least 60° (90°+ recommended)
+- Rotate robot in place
 - Keep AprilGrid visible throughout rotation
 - No translation, only pure rotation around vertical axis
 
@@ -163,6 +150,21 @@ rosrun kalibr kalibr_calibrate_robot_extrinsics \
 
 **Output:** 
 - `$ROTATE_DIR/recording-robot-extrinsics.yaml` - Camera pose relative to robot rotation axis
-- `$ROTATE_DIR/recording-robot-extrinsics.pdf` - Visualization of fitted circle and camera trajectory
+- `$ROTATE_DIR/recording-robot-extrinsics.pdf` - Visualization of fit
 
 **Note:** Camera yaw is assumed to be 0 (camera points forward in robot frame). The calibration determines roll, pitch, height, and distance from rotation axis. If your camera is mounted at a different yaw angle, adjust `camera_yaw_offset` in the output file manually.
+
+## Step 4: Export to RMAP Format
+
+Convert Kalibr output to RMAP format for VIO. The exported file will now also include a `Camera.extrinsics` section (see example below):
+
+```sh
+python3 /workspaces/kalibr/aslam_offline_calibration/kalibr/python/kalibr_export_vio \
+    --camchain $IMUCAM_DIR/recording-camchain-imucam.yaml \
+    --imu $DATA_DIR/imu.yaml \
+    --results $IMUCAM_DIR/recording-results-imucam.txt \
+    --extrinsics $ROTATE_DIR/recording-robot-extrinsics.yaml \
+    --output $DATA_DIR/rmap_calibration.yaml
+```
+
+**Output:** `$DATA_DIR/rmap_calibration.yaml` with camera intrinsics, IMU noise, `camera_T_imu` transform, timeshift, gravity magnitude, and `Camera.extrinsics`.

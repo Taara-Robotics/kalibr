@@ -257,6 +257,21 @@ def extract_camera_poses(bagfile, topic, camchain, target_config,
 
     return poses, camera, target_params
 
+def avg_wo_outliers(data):
+    """
+    Returns the average of data after removing outliers using the IQR method.
+    If all values are outliers or data is empty, returns np.nan.
+    """
+    data = np.asarray(data)
+    if len(data) < 4:
+        return np.mean(data) if len(data) > 0 else np.nan
+    q1 = np.percentile(data, 25)
+    q3 = np.percentile(data, 75)
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    filtered = data[(data >= lower) & (data <= upper)]
+    return np.mean(filtered) if len(filtered) > 0 else np.nan
 
 def main():
     # Parse arguments
@@ -292,28 +307,32 @@ def main():
 
     # target_height = target_params['targetHeight']
 
-    # Estimate camera roll/pitch assuming target is on level floor
-    # Get the z-axis (up vector) of the camera in the target frame for each pose
-    z_axes = np.array([T_t_c.C().dot(np.array([0, 0, 1])) for _, T_t_c in poses])
-    avg_z = np.mean(z_axes, axis=0)
-    avg_z /= np.linalg.norm(avg_z)
+    # # Estimate camera roll/pitch assuming target is on level floor
+    # # Get the z-axis (up vector) of the camera in the target frame for each pose
+    # z_axes = np.array([T_t_c.C().dot(np.array([0, 0, 1])) for _, T_t_c in poses])
+    # avg_z = np.mean(z_axes, axis=0)
+    # ...existing code...
 
-    # Compute roll and pitch from the average z vector
-    pitch = np.arcsin(-avg_z[0])  # rotation around y-axis
-    roll = np.arctan2(avg_z[1], avg_z[2])  # rotation around x-axis
-
-    print("Estimated camera roll [deg]:", np.degrees(roll))
-    print("Estimated camera pitch [deg]:", np.degrees(pitch))
+    # print("Estimated camera roll [deg]:", np.degrees(roll))
+    # print("Estimated camera pitch [deg]:", np.degrees(pitch))
 
     # Plot roll and pitch for each pose
     rolls = []
     pitches = []
+    z_axes = []
     for _, T_t_c in poses:
         Rmat = T_t_c.C()
-        # ZYX Euler: roll (x), pitch (y), yaw (z)
-        r, p, _ = R.from_dcm(Rmat).as_euler('xyz', degrees=True)
-        rolls.append(r)
-        pitches.append(p)
+        # Euler angles in 'xyz' and 'zyx' orders
+        r_xyz, p_xyz, y_xyz = R.from_dcm(Rmat).as_euler('xyz', degrees=True)
+        rolls.append(r_xyz)
+        pitches.append(p_xyz)
+        z_axes.append(Rmat[:,2])
+
+    roll = avg_wo_outliers(rolls)
+    pitch = avg_wo_outliers(pitches)
+
+    print("Estimated camera roll [deg]:", roll)
+    print("Estimated camera pitch [deg]:", pitch)
 
     # Plot roll and pitch side-by-side in one figure
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(10, 10))
@@ -332,7 +351,7 @@ def main():
     # Estimate and plot camera height above the floor for each pose
     target_height = target_params['targetHeight']
     cam_heights = np.array([T_t_c.t()[2] + target_height for _, T_t_c in poses])
-    avg_cam_height = np.mean(cam_heights)
+    avg_cam_height = avg_wo_outliers(cam_heights)
     print("Estimated average camera height above floor [m]:", avg_cam_height)
 
     ax3.plot(cam_heights, color='tab:green')
@@ -341,22 +360,98 @@ def main():
     ax3.set_title('Camera Height Above Floor per Pose')
     ax3.grid()
 
-    # Plot positions
+
+    # Plot positions and fit arcs to sequential segments
     positions = np.array([T_t_c.t() for _, T_t_c in poses])
-    ax4.scatter(positions[:, 0], positions[:, 1], label='Camera positions')
-    ax4.set_xlabel('X [m]')
-    ax4.set_ylabel('Y [m]')
-    ax4.set_title('Camera Positions During Rotation')
-    ax4.axis('equal')
+    min_length = 0.2
+    min_points = 3
+
+    # Segment positions by cumulative distance
+    def segment_positions_cumulative(positions, threshold):
+        segments = []
+        current = [positions[0]]
+        cum_dist = 0.0
+        for i in range(1, len(positions)):
+            step = np.linalg.norm(positions[i] - positions[i-1])
+            cum_dist += step
+            if cum_dist > threshold and len(current) >= min_points:
+                segments.append(np.array(current))
+                current = [positions[i]]
+                cum_dist = 0.0
+            else:
+                current.append(positions[i])
+        if current and len(current) >= min_points:
+            segments.append(np.array(current))
+        return segments
+
+    segments = segment_positions_cumulative(positions, threshold=min_length)
+    
+    # Plot radii per segment
+    radii = []
+
+    for idx, seg in enumerate(segments):
+        seg_length = np.sum([np.linalg.norm(seg[i] - seg[i-1]) for i in range(1, len(seg))])
+        if idx == len(segments) - 1 and seg_length < min_length:
+            continue
+        try:
+            cx, cy, r = pratt_circle_fit(seg[:, :2])
+            radii.append(r)
+        except Exception as e:
+            print(f"Arc fit failed for segment {idx+1}: {e}")
+
+    radii_np = np.array(radii)
+    avg_radius = avg_wo_outliers(radii_np)
+
+    print(f"Estimated average radius [m]: {avg_radius:.4f} m")
+
+    # Plot radii per segment
+    ax4.plot(radii_np, label='Estimated radius per segment')
+    ax4.set_xlabel('Segment')
+    ax4.set_ylabel('Estimated Radius [m]')
+    ax4.set_title('Estimated Arc Radius per Segment')
     ax4.grid()
     ax4.legend()
-    plt.show()
 
-    fig.tight_layout()
-    plt.show()
+    # Determine sign of avg_radius based on mean X position
+    mean_x = np.mean(positions[:, 0])
+
+    if mean_x < 0:
+        cam_robot_x = -abs(avg_radius)
+    else:
+        cam_robot_x = abs(avg_radius)
+
+    # Calculate T_camera_robot (REP-103)
+    t_cam_robot_rep103 = np.array([cam_robot_x, 0.0, avg_cam_height])
+    rpy_cam_robot_rep103 = np.array([pitch, (90-roll) % 180, 0]) # TODO: calculate roll, pitch properly
+
+    print("\nEstimated Camera-to-Robot Extrinsics (REP-103):")
+    print("Translation [m]: x={:.4f}, y={:.4f}, z={:.4f}".format(*t_cam_robot_rep103))
+    print("Rotation [deg]: roll={:.2f}, pitch={:.2f}, yaw={:.2f}".format(*rpy_cam_robot_rep103))
     
+    # Save plot
+    fig.tight_layout()
+    plot_filename = os.path.splitext(bagfile)[0] + '-robot-extrinsics.pdf'
+    pp = PdfPages(plot_filename)
+    pp.savefig(fig)
+    pp.close()
+    print("Saved calibration plots to:", plot_filename)
 
+    # Save extrinsics to yaml
+    extrinsics_output = {
+        'extrinsics': {
+            'x': float(t_cam_robot_rep103[0]),
+            'y': float(t_cam_robot_rep103[1]),
+            'z': float(t_cam_robot_rep103[2]),
+            'roll': float(rpy_cam_robot_rep103[0]),
+            'pitch': float(rpy_cam_robot_rep103[1]),
+            'yaw': float(rpy_cam_robot_rep103[2])
+        }
+    }
 
+    extrinsics_filename = os.path.splitext(bagfile)[0] + '-robot-extrinsics.yaml'
+    with open(extrinsics_filename, 'w') as f:
+        yaml.dump(extrinsics_output, f, default_flow_style=False)
+    print("Saved camera-to-robot extrinsics to:", extrinsics_filename)
 
     print("\nCalibration complete!")
 
