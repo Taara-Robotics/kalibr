@@ -1,5 +1,12 @@
 # Kalibr Camera-IMU Calibration
 
+## Step 0: Build
+
+Build the catkin workspace (first time only):
+```sh
+catkin build -j$(nproc)
+```
+
 ## Prerequisites
 
 Set the data directory:
